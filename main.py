@@ -43,12 +43,14 @@ async def handle_message(message: Message):
                 API_URL,
                 json={
                     "question": message.text,
-                    "uuid": str(message.chat.id)
+                    "userId": str(message.chat.id)
                 }
             ) as response:
                 if response.status == 200:
                     data = await response.json()
-                    await message.answer(data["body"]["answer"])
+                    print(data)
+                    if data:
+                        await message.answer(data["body"]["answer"])
                 else:
                     await message.answer("Извините, произошла ошибка при обработке запроса")
         except Exception as e:
