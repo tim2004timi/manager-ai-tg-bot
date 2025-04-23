@@ -50,7 +50,7 @@ async def handle_message(message: Message):
                     data = await response.json()
                     print(data)
                     if data:
-                        await message.answer(data["body"]["answer"])
+                        await message.answer(data["response"]["body"]["message"])
                 else:
                     await message.answer("Извините, произошла ошибка при обработке запроса")
         except Exception as e:
@@ -58,7 +58,7 @@ async def handle_message(message: Message):
             await message.answer("Извините, произошла ошибка при обработке запроса")
 
 def run_webhook():
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="localhost", port=8000)
 
 async def main():
     # Start webhook server in a separate thread
