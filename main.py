@@ -87,9 +87,10 @@ async def handle_message(message: Message):
                     data = await response.json()
                     print(data)
                     if data:
-                        await message.answer(data["response"]["body"]["message"])
+                        if "answer" in data:
+                            await message.answer(data["answer"]["message"])
                         # Отправляем на фронтенд по WebSocket
-                        await send_to_frontend_ws(data["response"]["body"])
+                        await send_to_frontend_ws(data)
                 else:
                     await message.answer("Извините, произошла ошибка при обработке запроса")
         except Exception as e:
