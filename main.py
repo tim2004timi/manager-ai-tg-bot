@@ -42,11 +42,20 @@ async def ws_connect():
             async for msg in ws_connection:
                 try:
                     data = json.loads(msg)
-                    # Ожидаем формат: { chat_id, message }
-                    chat_id = int(data.get("chat_id"))
+                    # Проверяем наличие необходимых полей
+                    if not isinstance(data, dict):
+                        continue
+                        
+                    chat_id = data.get("chat_id")
                     answer = data.get("message")
-                    if chat_id and answer:
-                        await bot.send_message(chat_id=chat_id, text=answer)
+                    
+                    # Проверяем, что оба поля существуют и chat_id можно преобразовать в число
+                    if chat_id is not None and answer is not None:
+                        try:
+                            chat_id = int(chat_id)
+                            await bot.send_message(chat_id=chat_id, text=answer)
+                        except (ValueError, TypeError):
+                            print(f"[WS] Invalid chat_id format: {chat_id}")
                 except Exception as e:
                     print(f"[WS] Error handling incoming message: {e}")
         except Exception as e:
