@@ -10,13 +10,16 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
-from crud import async_session, engine, Base, get_chats, get_chat, get_messages, create_chat, create_message, update_chat_waiting, update_chat_ai, get_stats
+from crud import async_session, engine, Base, get_chats, get_chat, get_messages, create_chat, create_message, update_chat_waiting, update_chat_ai, get_stats, get_chats_with_last_messages, get_chat_messages, get_chat_by_uuid
 import requests
 from pydantic import BaseModel
 from shared import get_bot
 import json
 from contextlib import asynccontextmanager
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+from datetime import datetime
+from sqlalchemy import select, insert
+from crud import Message
 
 # Load environment variables
 load_dotenv()
@@ -99,10 +102,30 @@ async def messages_websocket(websocket: WebSocket):
             try:
                 message_data = json.loads(data)
                 # If message is from frontend (manager), send it to the bot
-                if "chat_id" in message_data and "message" in message_data:
+                if "chatId" in message_data and "content" in message_data:
                     try:
-                        chat_id = int(message_data["chat_id"])
-                        await bot.send_message(chat_id=chat_id, text=message_data["message"])
+                        chat_id = int(message_data["chatId"])
+                        await bot.send_message(chat_id=chat_id, text=message_data["content"])
+                        # Create message in database
+                        chat = await get_chat(async_session(), chat_id)
+                        if chat:
+                            await create_message(
+                                async_session(),
+                                chat.id,
+                                message_data["content"],
+                                "text",
+                                False
+                            )
+                            # Send update to all clients
+                            update_message = {
+                                "type": "update",
+                                "chatId": str(chat_id),
+                                "content": message_data["content"],
+                                "message_type": "text",
+                                "ai": False,
+                                "timestamp": datetime.now().isoformat()
+                            }
+                            await updates_manager.broadcast(json.dumps(update_message))
                     except (ValueError, TypeError) as e:
                         logging.error(f"Invalid chat_id format: {e}")
                 # If message is from bot, broadcast it to all frontend clients
@@ -131,7 +154,7 @@ async def updates_websocket(websocket: WebSocket):
 # Endpoints
 @app.get("/api/chats")
 async def read_chats(db: AsyncSession = Depends(get_db)):
-    return await get_chats(db)
+    return await get_chats_with_last_messages(db)
 
 @app.get("/api/chats/{chat_id}")
 async def read_chat(chat_id: int, db: AsyncSession = Depends(get_db)):
@@ -141,8 +164,13 @@ async def read_chat(chat_id: int, db: AsyncSession = Depends(get_db)):
     return chat
 
 @app.get("/api/chats/{chat_id}/messages")
-async def read_messages(chat_id: int, db: AsyncSession = Depends(get_db)):
-    return await get_messages(db, chat_id)
+async def read_messages(
+    chat_id: int, 
+    page: int = 1,
+    limit: int = 50,
+    db: AsyncSession = Depends(get_db)
+):
+    return await get_chat_messages(db, chat_id, page, limit)
 
 # Schemas
 class ChatCreate(BaseModel):
@@ -181,6 +209,13 @@ async def update_ai(chat_id: int, data: AIUpdate, db: AsyncSession = Depends(get
     chat = await update_chat_ai(db, chat_id, data.ai)
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
+    # Отправляем обновление по WebSocket
+    update_message = {
+        "type": "chat_ai_updated",
+        "chatId": str(chat_id),
+        "ai": chat.ai
+    }
+    await updates_manager.broadcast(json.dumps(update_message))
     return chat
 
 @app.get("/api/stats")
@@ -207,27 +242,100 @@ async def handle_message(message: Message):
         await message.answer("Извините, но я понимаю только текстовые сообщения")
         return
 
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.post(
-                API_URL,
-                json={
-                    "question": message.text,
-                    "userId": str(message.chat.id)
-                }
-            ) as response:
-                if response.status == 200:
+    async with async_session() as session:
+        chat = await get_chat_by_uuid(session, str(message.chat.id))
+        if not chat:
+            return
+
+        # Создаем сообщение в базе данных
+        new_message = Message(
+            chat_id=chat.id,
+            message=message.text,
+            message_type="question",
+            ai=False,
+            created_at=datetime.now()
+        )
+        session.add(new_message)
+        await session.commit()
+
+        message_for_frontend = {
+            "type": "message",
+            "chatId": str(message.chat.id),
+            "content": message.text,
+            "message_type": "question",
+            "ai": False,
+            "timestamp": datetime.now().isoformat()
+        }
+        # Отправляем на фронтенд по WebSocket
+        print("Отправляем на фронтенд по WebSocket")
+        await messages_manager.broadcast(json.dumps(message_for_frontend))
+
+        if not chat.ai:
+            print("Chat is not ai")
+            return
+        
+        async with aiohttp.ClientSession() as http_session:
+            try:
+                async with http_session.post(
+                    API_URL,
+                    json={
+                        "question": message.text,
+                        "chat_id": chat.id
+                    }
+                ) as response:
+                    if response.status != 200:
+                        await message.answer("Извините, произошла ошибка при обработке запроса")
                     data = await response.json()
-                    if data:
-                        if "answer" in data:
-                            await message.answer(data["answer"]["message"])
+                    if not data:
+                        await message.answer("Извините, произошла ошибка при обработке запроса")
+                    if "Answer" in data:
+                        answer = data["Answer"]
+                        print(answer)
+                        await message.answer(answer)
+                        # Create message in database
+                        new_answer = Message(
+                            chat_id=chat.id,
+                            message=answer,
+                            message_type="answer",
+                            ai=True,
+                            created_at=datetime.now()
+                        )
+                        session.add(new_answer)
+                        await session.commit()
+                        # Format message for frontend
+                        message_for_frontend = {
+                            "type": "message",
+                            "chatId": str(chat.id),
+                            "content": answer,
+                            "message_type": "answer",
+                            "ai": True,
+                            "timestamp": datetime.now().isoformat()
+                        }
                         # Отправляем на фронтенд по WebSocket
-                        await messages_manager.broadcast(json.dumps(data))
-                else:
-                    await message.answer("Извините, произошла ошибка при обработке запроса")
-        except Exception as e:
-            logging.error(f"Error processing message: {e}")
-            await message.answer("Извините, произошла ошибка при обработке запроса")
+                        await messages_manager.broadcast(json.dumps(message_for_frontend))
+
+            except Exception as e:
+                logging.error(f"Error processing message: {e}")
+                await message.answer("Извините, произошла ошибка при обработке запроса")
+
+@app.delete("/api/chats/{chat_id}")
+async def delete_chat(chat_id: int, db: AsyncSession = Depends(get_db)):
+    chat = await get_chat(db, chat_id)
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    # Удаляем все сообщения этого чата
+    messages = await db.execute(select(Message).where(Message.chat_id == chat_id))
+    for msg in messages.scalars().all():
+        await db.delete(msg)
+    await db.delete(chat)
+    await db.commit()
+    # Отправляем уведомление по WebSocket всем фронтендам
+    update_message = {
+        "type": "chat_deleted",
+        "chatId": str(chat_id)
+    }
+    await updates_manager.broadcast(json.dumps(update_message))
+    return {"success": True}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="localhost", port=3001)

@@ -1,9 +1,10 @@
 import os
 from dotenv import load_dotenv
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker, declarative_base, relationship
-from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, DateTime, func, select
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship, selectinload
+from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, DateTime, func, select, desc
 from sqlalchemy.exc import SQLAlchemyError
+from typing import List, Optional, Dict, Any
 
 # Load environment variables
 load_dotenv()
@@ -49,6 +50,10 @@ async def get_chats(db: AsyncSession):
 
 async def get_chat(db: AsyncSession, chat_id: int):
     result = await db.execute(select(Chat).filter(Chat.id == chat_id))
+    return result.scalar_one_or_none()
+
+async def get_chat_by_uuid(db: AsyncSession, uuid: str):
+    result = await db.execute(select(Chat).filter(Chat.uuid == uuid))
     return result.scalar_one_or_none()
 
 async def get_messages(db: AsyncSession, chat_id: int):
@@ -101,4 +106,72 @@ async def get_stats(db: AsyncSession):
     total = await db.scalar(select(func.count(Chat.id)))
     pending = await db.scalar(select(func.count(Chat.id)).filter(Chat.waiting == True))
     ai_count = await db.scalar(select(func.count(Chat.id)).filter(Chat.ai == True))
-    return {"total": total, "pending": pending, "ai": ai_count} 
+    return {"total": total, "pending": pending, "ai": ai_count}
+
+async def get_chats_with_last_messages(db: AsyncSession, limit: int = 20) -> List[Dict[str, Any]]:
+    """Get all chats with their last message"""
+    # First get all chats
+    query = select(Chat).order_by(desc(Chat.id))
+    if limit:
+        query = query.limit(limit)
+    result = await db.execute(query)
+    chats = result.scalars().all()
+    
+    chats_with_messages = []
+    for chat in chats:
+        # Get only the last message for each chat
+        last_message_query = (
+            select(Message)
+            .where(Message.chat_id == chat.id)
+            .order_by(desc(Message.id))
+            .limit(1)
+        )
+        last_message_result = await db.execute(last_message_query)
+        last_message = last_message_result.scalar_one_or_none()
+        
+        chat_dict = {
+            "id": chat.id,
+            "uuid": chat.uuid,
+            "ai": chat.ai,
+            "waiting": chat.waiting,
+            "last_message": None
+        }
+        
+        if last_message:
+            chat_dict["last_message"] = {
+                "id": last_message.id,
+                "content": last_message.message,
+                "message_type": last_message.message_type,
+                "ai": last_message.ai,
+                "timestamp": last_message.created_at.isoformat() if last_message.created_at else None
+            }
+        
+        chats_with_messages.append(chat_dict)
+    
+    return chats_with_messages
+
+async def get_chat_messages(db: AsyncSession, chat_id: int, page: int = 1, limit: int = 50) -> List[Dict[str, Any]]:
+    """Get messages for a specific chat with pagination"""
+    offset = (page - 1) * limit
+    query = (
+        select(Message)
+        .where(Message.chat_id == chat_id)
+        .order_by(desc(Message.created_at))
+        .limit(limit)
+        .offset(offset)
+    )
+    
+    result = await db.execute(query)
+    messages = result.scalars().all()
+    
+    return [
+        {
+            "id": msg.id,
+            "content": msg.message,
+            "message_type": msg.message_type,
+            "ai": msg.ai,
+            "timestamp": msg.created_at.isoformat() if msg.created_at else None,
+            "chatId": str(chat_id)
+        }
+        for msg in messages
+    ] 
