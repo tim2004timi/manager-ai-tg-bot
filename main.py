@@ -10,7 +10,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
-from crud import async_session, engine, Base, get_chats, get_chat, get_messages, create_chat, create_message, update_chat_waiting, update_chat_ai, get_stats, get_chats_with_last_messages, get_chat_messages, get_chat_by_uuid
+from crud import async_session, engine, Base, get_chats, get_chat, get_messages, create_chat, create_message, update_chat_waiting, update_chat_ai, get_stats, get_chats_with_last_messages, get_chat_messages, get_chat_by_uuid, add_chat_tag, remove_chat_tag
 import requests
 from pydantic import BaseModel
 from shared import get_bot
@@ -20,6 +20,7 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime
 from sqlalchemy import select, insert
 from crud import Message
+import crud
 
 # Load environment variables
 load_dotenv()
@@ -189,7 +190,32 @@ class MessageCreate(BaseModel):
 
 @app.post("/api/messages")
 async def create_message_endpoint(msg: MessageCreate, db: AsyncSession = Depends(get_db)):
-    return await create_message(db, msg.chat_id, msg.message, msg.message_type, msg.ai)
+    # 1. Создаем сообщение в БД
+    new_message = await create_message(db, msg.chat_id, msg.message, msg.message_type, msg.ai)
+    
+    # 2. Получаем UUID чата для отправки в Телеграм
+    chat = await get_chat(db, msg.chat_id)
+    if chat and chat.uuid:
+        try:
+            await bot.send_message(chat_id=chat.uuid, text=msg.message)
+        except Exception as e:
+            logging.error(f"Error sending message to Telegram chat {chat.uuid}: {e}")
+    
+    # 4. Форматируем сообщение для WebSocket
+    message_for_frontend = {
+        "type": "message",
+        "chatId": new_message.chat_id,
+        "content": new_message.message,
+        "message_type": new_message.message_type,
+        "ai": new_message.ai,
+        "timestamp": new_message.created_at.isoformat(),
+        "id": new_message.id
+    }
+
+    # 5. Отправляем на фронтенд по WebSocket
+    await messages_manager.broadcast(json.dumps(message_for_frontend))
+    
+    return new_message
 
 class WaitingUpdate(BaseModel):
     waiting: bool
@@ -222,12 +248,16 @@ async def update_ai(chat_id: int, data: AIUpdate, db: AsyncSession = Depends(get
 async def stats(db: AsyncSession = Depends(get_db)):
     return await get_stats(db)
 
-@app.post("/api/webhook/messages")
-async def proxy_webhook(payload: dict):
-    webhook_url = os.getenv("WEBHOOK_URL")
-    async with aiohttp.ClientSession() as session:
-        async with session.post(webhook_url, json=payload) as response:
-            return await response.json(), response.status
+class TagCreate(BaseModel):
+    tag: str
+
+@app.post("/api/chats/{chat_id}/tags")
+async def add_chat_tag_endpoint(chat_id: int, tag_data: TagCreate, db: AsyncSession = Depends(get_db)):
+    return await crud.add_chat_tag(db, chat_id, tag_data.tag)
+
+@app.delete("/api/chats/{chat_id}/tags/{tag}")
+async def remove_chat_tag_endpoint(chat_id: int, tag: str, db: AsyncSession = Depends(get_db)):
+    return await crud.remove_chat_tag(db, chat_id, tag)
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
@@ -246,8 +276,6 @@ async def handle_message(message: Message):
         chat = await get_chat_by_uuid(session, str(message.chat.id))
         if not chat:
             chat = await create_chat(session, str(message.chat.id), name=message.chat.first_name, messager="telegram")
-
-
 
         # Создаем сообщение в базе данных
         new_message = Message(
@@ -271,11 +299,16 @@ async def handle_message(message: Message):
             "id": new_message.id
         }
         # Отправляем на фронтенд по WebSocket
-        print("Отправляем на фронтенд по WebSocket")
         await messages_manager.broadcast(json.dumps(message_for_frontend))
 
         if not chat.ai:
-            print("Chat is not ai")
+            await update_chat_waiting(db=session, chat_id=chat.id, waiting=True)
+            # Send WebSocket update about chat status change
+            await messages_manager.broadcast({
+                "type": "chat_update",
+                "chat_id": chat.id,
+                "waiting": True
+            })
             return
         
         async with aiohttp.ClientSession() as http_session:

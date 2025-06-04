@@ -67,13 +67,13 @@ async def get_messages(db: AsyncSession, chat_id: int):
     )
     return result.scalars().all()
 
-async def create_chat(db: AsyncSession, uuid: str, ai: bool = True, name: str = "Не известно", tags: List[str] = None):
+async def create_chat(db: AsyncSession, uuid: str, ai: bool = True, name: str = "Не известно", tags: List[str] = None, messager: str = "telegram"):
     new_chat = Chat(
         uuid=uuid,
         ai=ai,
         name=name,
         tags=tags or [],
-        messager="telegram"
+        messager=messager
     )
     db.add(new_chat)
     try:
@@ -187,3 +187,45 @@ async def get_chat_messages(db: AsyncSession, chat_id: int, page: int = 1, limit
         }
         for msg in messages
     ] 
+
+async def add_chat_tag(db: AsyncSession, chat_id: int, tag: str) -> dict:
+    chat = await get_chat(db, chat_id)
+    if not chat:
+        return {"message": "error"}
+    
+    try:
+        # Инициализируем tags как пустой список, если None
+        if chat.tags is None:
+            chat.tags = []
+        
+        # Добавляем тег, если его еще нет
+        if tag not in chat.tags:
+            chat.tags = chat.tags + [tag]  # Создаем новый список для ARRAY
+        
+        await db.commit()
+        await db.refresh(chat)
+        return {"success": True, "tags": chat.tags}
+    except Exception as e:
+        await db.rollback()
+        return {"message": "error"}
+
+async def remove_chat_tag(db: AsyncSession, chat_id: int, tag: str) -> dict:
+    chat = await get_chat(db, chat_id)
+    if not chat:
+        return {"message": "error"}
+    
+    try:
+        # Инициализируем tags как пустой список, если None
+        if chat.tags is None:
+            chat.tags = []
+        
+        # Удаляем тег, если он есть
+        if tag in chat.tags:
+            chat.tags = [t for t in chat.tags if t != tag]  # Создаем новый список без тега
+        
+        await db.commit()
+        await db.refresh(chat)
+        return {"success": True, "tags": chat.tags}
+    except Exception as e:
+        await db.rollback()
+        return {"message": "error"}
