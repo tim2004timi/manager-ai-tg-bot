@@ -245,7 +245,9 @@ async def handle_message(message: Message):
     async with async_session() as session:
         chat = await get_chat_by_uuid(session, str(message.chat.id))
         if not chat:
-            return
+            chat = await create_chat(session, str(message.chat.id), name=message.chat.first_name, messager="telegram")
+
+
 
         # Создаем сообщение в базе данных
         new_message = Message(
@@ -257,14 +259,16 @@ async def handle_message(message: Message):
         )
         session.add(new_message)
         await session.commit()
+        await session.refresh(new_message)
 
         message_for_frontend = {
             "type": "message",
-            "chatId": str(message.chat.id),
+            "chatId": chat.id,
             "content": message.text,
             "message_type": "question",
             "ai": False,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": new_message.created_at.isoformat(),
+            "id": new_message.id
         }
         # Отправляем на фронтенд по WebSocket
         print("Отправляем на фронтенд по WebSocket")
@@ -302,14 +306,16 @@ async def handle_message(message: Message):
                         )
                         session.add(new_answer)
                         await session.commit()
+                        await session.refresh(new_answer)
                         # Format message for frontend
                         message_for_frontend = {
                             "type": "message",
-                            "chatId": str(chat.id),
+                            "chatId": chat.id,
                             "content": answer,
                             "message_type": "answer",
                             "ai": True,
-                            "timestamp": datetime.now().isoformat()
+                            "timestamp": new_answer.created_at.isoformat(),
+                            "id": new_answer.id
                         }
                         # Отправляем на фронтенд по WebSocket
                         await messages_manager.broadcast(json.dumps(message_for_frontend))

@@ -2,7 +2,7 @@ import os
 from dotenv import load_dotenv
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, selectinload
-from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, DateTime, func, select, desc
+from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, DateTime, func, select, desc, ARRAY
 from sqlalchemy.exc import SQLAlchemyError
 from typing import List, Optional, Dict, Any
 
@@ -31,6 +31,9 @@ class Chat(Base):
     uuid = Column(String, unique=True, nullable=False)
     ai = Column(Boolean, default=False)
     waiting = Column(Boolean, default=False)
+    tags = Column(ARRAY(String), default=[])
+    name = Column(String(30), default="Не известно")
+    messager = Column(String(16), nullable=False, default="telegram")
     messages = relationship("Message", back_populates="chat")
 
 class Message(Base):
@@ -64,8 +67,14 @@ async def get_messages(db: AsyncSession, chat_id: int):
     )
     return result.scalars().all()
 
-async def create_chat(db: AsyncSession, uuid: str, ai: bool = False):
-    new_chat = Chat(uuid=uuid, ai=ai)
+async def create_chat(db: AsyncSession, uuid: str, ai: bool = True, name: str = "Не известно", tags: List[str] = None):
+    new_chat = Chat(
+        uuid=uuid,
+        ai=ai,
+        name=name,
+        tags=tags or [],
+        messager="telegram"
+    )
     db.add(new_chat)
     try:
         await db.commit()
@@ -134,6 +143,9 @@ async def get_chats_with_last_messages(db: AsyncSession, limit: int = 20) -> Lis
             "uuid": chat.uuid,
             "ai": chat.ai,
             "waiting": chat.waiting,
+            "name": chat.name,
+            "tags": chat.tags,
+            "messager": chat.messager,
             "last_message": None
         }
         
