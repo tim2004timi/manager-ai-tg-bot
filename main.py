@@ -166,12 +166,10 @@ async def read_chat(chat_id: int, db: AsyncSession = Depends(get_db)):
 
 @app.get("/api/chats/{chat_id}/messages")
 async def read_messages(
-    chat_id: int, 
-    page: int = 1,
-    limit: int = 50,
+    chat_id: int,
     db: AsyncSession = Depends(get_db)
 ):
-    return await get_chat_messages(db, chat_id, page, limit)
+    return await get_chat_messages(db, chat_id)
 
 # Schemas
 class ChatCreate(BaseModel):
@@ -204,7 +202,7 @@ async def create_message_endpoint(msg: MessageCreate, db: AsyncSession = Depends
     # 4. Форматируем сообщение для WebSocket
     message_for_frontend = {
         "type": "message",
-        "chatId": new_message.chat_id,
+        "chatId": str(new_message.chat_id),
         "content": new_message.message,
         "message_type": new_message.message_type,
         "ai": new_message.ai,
@@ -276,6 +274,22 @@ async def handle_message(message: Message):
         chat = await get_chat_by_uuid(session, str(message.chat.id))
         if not chat:
             chat = await create_chat(session, str(message.chat.id), name=message.chat.first_name, messager="telegram")
+            # Send WebSocket update about new chat creation
+            new_chat_message = {
+                "type": "chat_created",
+                "chat": {
+                    "id": chat.id,
+                    "uuid": chat.uuid,
+                    "name": chat.name,
+                    "messager": chat.messager,
+                    "waiting": chat.waiting,
+                    "ai": chat.ai,
+                    "tags": chat.tags,
+                    "last_message_content": None, # New chat has no last message yet
+                    "last_message_timestamp": None # New chat has no last message yet
+                }
+            }
+            await updates_manager.broadcast(json.dumps(new_chat_message))
 
         # Создаем сообщение в базе данных
         new_message = Message(
@@ -289,12 +303,13 @@ async def handle_message(message: Message):
         await session.commit()
         await session.refresh(new_message)
 
+        # Format message for frontend
         message_for_frontend = {
             "type": "message",
-            "chatId": chat.id,
-            "content": message.text,
-            "message_type": "question",
-            "ai": False,
+            "chatId": str(new_message.chat_id),
+            "content": new_message.message,
+            "message_type": new_message.message_type,
+            "ai": new_message.ai,
             "timestamp": new_message.created_at.isoformat(),
             "id": new_message.id
         }
@@ -304,11 +319,12 @@ async def handle_message(message: Message):
         if not chat.ai:
             await update_chat_waiting(db=session, chat_id=chat.id, waiting=True)
             # Send WebSocket update about chat status change
-            await messages_manager.broadcast({
+            update_message = {
                 "type": "chat_update",
                 "chat_id": chat.id,
                 "waiting": True
-            })
+            }
+            await updates_manager.broadcast(json.dumps(update_message))
             return
         
         async with aiohttp.ClientSession() as http_session:

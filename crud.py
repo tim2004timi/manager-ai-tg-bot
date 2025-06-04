@@ -162,20 +162,21 @@ async def get_chats_with_last_messages(db: AsyncSession, limit: int = 20) -> Lis
     
     return chats_with_messages
 
-async def get_chat_messages(db: AsyncSession, chat_id: int, page: int = 1, limit: int = 50) -> List[Dict[str, Any]]:
-    """Get messages for a specific chat with pagination"""
-    offset = (page - 1) * limit
+async def get_chat_messages(db: AsyncSession, chat_id: int) -> List[Dict[str, Any]]:
+    """Get all messages for a specific chat"""
+    # Remove pagination: page and limit
     query = (
         select(Message)
         .where(Message.chat_id == chat_id)
-        .order_by(desc(Message.created_at))
-        .limit(limit)
-        .offset(offset)
+        .order_by(desc(Message.created_at)) # Keep ordering
+        # Removed: .limit(limit)
+        # Removed: .offset(offset)
     )
     
-    result = await db.execute(query)
-    messages = result.scalars().all()
+    result = await db.execute(query);
+    messages = result.scalars().all();
     
+    # Prepare messages in the format expected by the frontend
     return [
         {
             "id": msg.id,
@@ -186,7 +187,7 @@ async def get_chat_messages(db: AsyncSession, chat_id: int, page: int = 1, limit
             "chatId": str(chat_id)
         }
         for msg in messages
-    ] 
+    ]
 
 async def add_chat_tag(db: AsyncSession, chat_id: int, tag: str) -> dict:
     chat = await get_chat(db, chat_id)
