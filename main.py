@@ -155,7 +155,9 @@ async def updates_websocket(websocket: WebSocket):
 # Endpoints
 @app.get("/api/chats")
 async def read_chats(db: AsyncSession = Depends(get_db)):
-    return await get_chats_with_last_messages(db)
+    chats_data = await get_chats_with_last_messages(db)
+    print("Backend /api/chats response data:", chats_data)
+    return chats_data
 
 @app.get("/api/chats/{chat_id}")
 async def read_chat(chat_id: int, db: AsyncSession = Depends(get_db)):
@@ -251,11 +253,29 @@ class TagCreate(BaseModel):
 
 @app.post("/api/chats/{chat_id}/tags")
 async def add_chat_tag_endpoint(chat_id: int, tag_data: TagCreate, db: AsyncSession = Depends(get_db)):
-    return await crud.add_chat_tag(db, chat_id, tag_data.tag)
+    result = await crud.add_chat_tag(db, chat_id, tag_data.tag)
+    if result.get("success"):
+        # Broadcast updated tags via WebSocket
+        update_message = {
+            "type": "chat_tags_updated",
+            "chatId": chat_id,
+            "tags": result["tags"]
+        }
+        await updates_manager.broadcast(json.dumps(update_message))
+    return result
 
 @app.delete("/api/chats/{chat_id}/tags/{tag}")
 async def remove_chat_tag_endpoint(chat_id: int, tag: str, db: AsyncSession = Depends(get_db)):
-    return await crud.remove_chat_tag(db, chat_id, tag)
+    result = await crud.remove_chat_tag(db, chat_id, tag)
+    if result.get("success"):
+        # Broadcast updated tags via WebSocket
+        update_message = {
+            "type": "chat_tags_updated",
+            "chatId": chat_id,
+            "tags": result["tags"]
+        }
+        await updates_manager.broadcast(json.dumps(update_message))
+    return result
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
