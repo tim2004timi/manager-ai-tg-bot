@@ -361,8 +361,8 @@ async def handle_message(message: Message):
                     data = await response.json()
                     if not data:
                         await message.answer("Извините, произошла ошибка при обработке запроса")
-                    if "Answer" in data:
-                        answer = data["Answer"]
+                    if "answer" in data:
+                        answer = data["answer"]
                         print(answer)
                         await message.answer(answer)
                         # Create message in database
@@ -388,6 +388,19 @@ async def handle_message(message: Message):
                         }
                         # Отправляем на фронтенд по WebSocket
                         await messages_manager.broadcast(json.dumps(message_for_frontend))
+                    if "manager" in data and data["manager"] == "true":
+                        print(data["manager"])
+                        await update_chat_waiting(db=session, chat_id=chat.id, waiting=True)
+                        await update_chat_ai(db=session, chat_id=chat.id, ai=False)
+                        # Send WebSocket update about chat status change
+                        update_message = {
+                            "type": "chat_update",
+                            "chat_id": chat.id,
+                            "waiting": True,
+                            "ai": False
+                        }
+                        await updates_manager.broadcast(json.dumps(update_message))
+
 
             except Exception as e:
                 logging.error(f"Error processing message: {e}")
