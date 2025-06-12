@@ -44,7 +44,9 @@ class Message(Base):
     message_type = Column(String, nullable=False)
     ai = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    is_image = Column(Boolean, default=False)
     chat = relationship("Chat", back_populates="messages")
+
 
 # CRUD operations
 async def get_chats(db: AsyncSession):

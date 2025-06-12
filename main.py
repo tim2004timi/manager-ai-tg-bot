@@ -21,6 +21,9 @@ from datetime import datetime
 from sqlalchemy import select, insert
 from crud import Message
 import crud
+from aiogram import F
+from utils import upload_to_minio
+from minio import Minio
 
 # Load environment variables
 load_dotenv()
@@ -284,7 +287,7 @@ async def cmd_start(message: Message):
         "Можете задать любой вопрос"
     )
 
-@dp.message()
+@dp.message(F.text)
 async def handle_message(message: Message):
     if not message.text:
         await message.answer("Извините, но я понимаю только текстовые сообщения")
@@ -405,6 +408,56 @@ async def handle_message(message: Message):
             except Exception as e:
                 logging.error(f"Error processing message: {e}")
                 await message.answer("Извините, произошла ошибка при обработке запроса")
+
+APP_HOST = os.getenv("APP_HOST", "localhost")
+
+BUCKET_NAME = "psih-photo"
+minio_client = Minio(
+    endpoint="localhost:9000",
+    access_key="admin",
+    secret_key="password123",
+    secure=False  # True для HTTPS
+)
+@dp.message(F.photo)
+async def handle_photos(message: types.Message):
+    # Берем фото с самым высоким разрешением
+    photo = message.photo[-1]
+    
+    # Скачиваем фото
+    file = await bot.get_file(photo.file_id)
+    file_data = await bot.download_file(file.file_path)
+    
+    # Генерируем уникальное имя файла
+    file_extension = os.path.splitext(file.file_path)[1]
+    file_name = f"{message.from_user.id}-{photo.file_id}{file_extension}"
+    
+    # Асинхронно загружаем в Minio
+    success = minio_client.put_object(
+                bucket_name=BUCKET_NAME,
+                object_name=file_name,
+                data=file_data,
+                length=photo.file_size,
+                content_type="image/jpeg"
+            )
+    
+    if success:
+        async with async_session() as session:
+            # Создаем сообщение в базе данных
+            chat = await get_chat_by_uuid(session, str(message.chat.id))
+            new_message = Message(
+                chat_id=chat.id,
+                message=f"http://{APP_HOST}:9000/{BUCKET_NAME}/{file_name}",
+                message_type="question",
+                ai=False,
+                created_at=datetime.now(),
+                is_image=True
+            )
+            session.add(new_message)
+            await session.commit()
+            await session.refresh(new_message)
+        await message.reply(f"Фото успешно отправлено")
+    else:
+        await message.reply("Произошла ошибка при загрузке фото")
 
 @app.delete("/api/chats/{chat_id}")
 async def delete_chat(chat_id: int, db: AsyncSession = Depends(get_db)):
