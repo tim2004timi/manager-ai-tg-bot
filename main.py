@@ -43,7 +43,7 @@ APP_HOST = os.getenv("APP_HOST", "localhost")
 
 BUCKET_NAME = "psih-photo"
 minio_client = Minio(
-    endpoint="localhost:9000",
+    endpoint=f"{APP_HOST}:9000",
     access_key="tim2004timi",
     secret_key="timitimitimiimi",
     secure=False  # True для HTTPS
