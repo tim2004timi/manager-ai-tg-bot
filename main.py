@@ -7,7 +7,7 @@ import aiohttp
 from dotenv import load_dotenv
 import os
 import uvicorn
-from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 from crud import async_session, engine, Base, get_chats, get_chat, get_messages, create_chat, create_message, update_chat_waiting, update_chat_ai, get_stats, get_chats_with_last_messages, get_chat_messages, get_chat_by_uuid, add_chat_tag, remove_chat_tag
@@ -24,6 +24,8 @@ import crud
 from aiogram import F
 from utils import upload_to_minio
 from minio import Minio
+import io
+import tempfile
 
 # Load environment variables
 load_dotenv()
@@ -36,7 +38,16 @@ bot = get_bot()
 dp = Dispatcher()
 
 # API endpoint for sending questions
-API_URL = os.getenv("API_URL", "http://your-api-endpoint.com/chat")
+API_URL = os.getenv("API_URL", "http://pavel")
+APP_HOST = os.getenv("APP_HOST", "localhost")
+
+BUCKET_NAME = "psih-photo"
+minio_client = Minio(
+    endpoint="localhost:9000",
+    access_key="admin",
+    secret_key="password123",
+    secure=False  # True для HTTPS
+)
 
 # Create database tables
 async def init_db():
@@ -409,15 +420,7 @@ async def handle_message(message: Message):
                 logging.error(f"Error processing message: {e}")
                 await message.answer("Извините, произошла ошибка при обработке запроса")
 
-APP_HOST = os.getenv("APP_HOST", "localhost")
 
-BUCKET_NAME = "psih-photo"
-minio_client = Minio(
-    endpoint="localhost:9000",
-    access_key="admin",
-    secret_key="password123",
-    secure=False  # True для HTTPS
-)
 @dp.message(F.photo)
 async def handle_photos(message: types.Message):
     # Берем фото с самым высоким разрешением
@@ -455,7 +458,19 @@ async def handle_photos(message: types.Message):
             session.add(new_message)
             await session.commit()
             await session.refresh(new_message)
-        await message.reply(f"Фото успешно отправлено")
+            # Format message for frontend
+            message_for_frontend = {
+                "type": "message",
+                "chatId": str(new_message.chat_id),
+                "content": new_message.message,
+                "message_type": new_message.message_type,
+                "ai": new_message.ai,
+                "timestamp": new_message.created_at.isoformat(),
+                "id": new_message.id,
+                "is_image": new_message.is_image
+            }
+            # Отправляем на фронтенд по WebSocket
+            await messages_manager.broadcast(json.dumps(message_for_frontend))
     else:
         await message.reply("Произошла ошибка при загрузке фото")
 
@@ -477,6 +492,83 @@ async def delete_chat(chat_id: int, db: AsyncSession = Depends(get_db)):
     }
     await updates_manager.broadcast(json.dumps(update_message))
     return {"success": True}
+
+@app.post("/api/messages/image")
+async def upload_image(
+    image: UploadFile = File(...),
+    chat_id: int = Form(...),
+    db: AsyncSession = Depends(get_db)
+):
+    try:
+        # Get chat from database
+        chat = await get_chat(db, chat_id)
+        if not chat:
+            raise HTTPException(status_code=404, detail="Chat not found")
+
+        # Read image file
+        contents = await image.read()
+        
+        # Generate unique filename
+        file_extension = os.path.splitext(image.filename)[1]
+        file_name = f"{chat_id}-{datetime.now().strftime('%Y%m%d%H%M%S')}{file_extension}"
+        
+        # Upload to MinIO
+        try:
+            minio_client.put_object(
+                bucket_name=BUCKET_NAME,
+                object_name=file_name,
+                data=io.BytesIO(contents),
+                length=len(contents),
+                content_type=image.content_type
+            )
+        except Exception as e:
+            logging.error(f"Error uploading to MinIO: {e}")
+            raise HTTPException(status_code=500, detail="Failed to upload image to storage")
+        
+        # Create message in database
+        image_url = f"http://{APP_HOST}:9000/{BUCKET_NAME}/{file_name}"
+        new_message = Message(
+            chat_id=chat_id,
+            message=image_url,
+            message_type="answer",
+            ai=False,
+            created_at=datetime.now(),
+            is_image=True
+        )
+        db.add(new_message)
+        await db.commit()
+        await db.refresh(new_message)
+        
+        # Send to Telegram
+        try:
+            # Create a temporary file to send to Telegram
+            with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_file:
+                temp_file.write(contents)
+                temp_file.flush()
+                await bot.send_photo(chat_id=chat.uuid, photo=types.FSInputFile(temp_file.name))
+            # Clean up the temporary file
+            os.unlink(temp_file.name)
+        except Exception as e:
+            logging.error(f"Error sending photo to Telegram: {e}")
+        
+        # Send WebSocket update
+        message_for_frontend = {
+            "type": "message",
+            "chatId": str(new_message.chat_id),
+            "content": new_message.message,
+            "message_type": new_message.message_type,
+            "ai": new_message.ai,
+            "timestamp": new_message.created_at.isoformat(),
+            "id": new_message.id,
+            "is_image": new_message.is_image
+        }
+        await messages_manager.broadcast(json.dumps(message_for_frontend))
+        
+        return {"success": True, "message": "Image uploaded successfully"}
+        
+    except Exception as e:
+        logging.error(f"Error uploading image: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=3001)

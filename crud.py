@@ -186,7 +186,8 @@ async def get_chat_messages(db: AsyncSession, chat_id: int) -> List[Dict[str, An
             "message_type": msg.message_type,
             "ai": msg.ai,
             "timestamp": msg.created_at.isoformat() if msg.created_at else None,
-            "chatId": str(chat_id)
+            "chatId": str(chat_id),
+            "is_image": msg.is_image
         }
         for msg in messages
     ]
