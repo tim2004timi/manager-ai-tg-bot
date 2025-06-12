@@ -44,8 +44,8 @@ APP_HOST = os.getenv("APP_HOST", "localhost")
 BUCKET_NAME = "psih-photo"
 minio_client = Minio(
     endpoint="localhost:9000",
-    access_key="admin",
-    secret_key="password123",
+    access_key="tim2004timi",
+    secret_key="timitimitimiimi",
     secure=False  # True для HTTPS
 )
 
@@ -471,6 +471,13 @@ async def handle_photos(message: types.Message):
             }
             # Отправляем на фронтенд по WebSocket
             await messages_manager.broadcast(json.dumps(message_for_frontend))
+
+            update_message = {
+                "type": "chat_update",
+                "chat_id": chat.id,
+                "waiting": True
+            }
+            await updates_manager.broadcast(json.dumps(update_message))
     else:
         await message.reply("Произошла ошибка при загрузке фото")
 
