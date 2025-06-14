@@ -7,8 +7,9 @@ import aiohttp
 from dotenv import load_dotenv
 import os
 import uvicorn
-from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from crud import async_session, engine, Base, get_chats, get_chat, get_messages, create_chat, create_message, update_chat_waiting, update_chat_ai, get_stats, get_chats_with_last_messages, get_chat_messages, get_chat_by_uuid, add_chat_tag, remove_chat_tag
 import requests
@@ -33,6 +34,7 @@ load_dotenv()
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 
+
 # Initialize bot and dispatcher
 bot = get_bot()
 dp = Dispatcher()
@@ -43,7 +45,7 @@ APP_HOST = os.getenv("APP_HOST", "localhost")
 
 BUCKET_NAME = "psih-photo"
 minio_client = Minio(
-    endpoint=f"{APP_HOST}:9000",
+    endpoint=f"minio:9000",
     access_key="tim2004timi",
     secret_key="timitimitimiimi",
     secure=False  # True для HTTPS
@@ -69,6 +71,7 @@ async def lifespan(app: FastAPI):
         pass
 
 app = FastAPI(lifespan=lifespan)
+
 
 # CORS configuration
 app.add_middleware(
@@ -576,6 +579,7 @@ async def upload_image(
     except Exception as e:
         logging.error(f"Error uploading image: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=3001)
