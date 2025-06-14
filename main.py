@@ -581,5 +581,20 @@ async def upload_image(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+ai_context = "Фирас лох"
+@app.get("/api/ai/context")
+async def get_ai_context():
+    global ai_context
+    return {"context": ai_context}
+
+class PutAIContext(BaseModel):
+    ai_context: str
+
+@app.put("/api/ai/context")
+async def put_ai_context(new_ai_context: PutAIContext):
+    global ai_context
+    ai_context = new_ai_context.ai_context
+    return {"context": ai_context}
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=3001)
