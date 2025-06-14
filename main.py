@@ -581,20 +581,38 @@ async def upload_image(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-ai_context = "Фирас лох"
+
 @app.get("/api/ai/context")
 async def get_ai_context():
-    global ai_context
-    return {"context": ai_context}
+    async with aiohttp.ClientSession() as http_session:
+        try:
+            async with http_session.get(
+                API_URL,
+            ) as response:
+                data = await response.json()
+                return data
+        except Exception as e:
+            HTTPException(status_code=500, detail=f"Ошибка при отправке на API {e}")
 
 class PutAIContext(BaseModel):
-    ai_context: str
+    system_message: str
+    faqs: str
 
 @app.put("/api/ai/context")
 async def put_ai_context(new_ai_context: PutAIContext):
-    global ai_context
-    ai_context = new_ai_context.ai_context
-    return {"context": ai_context}
+    async with aiohttp.ClientSession() as http_session:
+        try:
+            async with http_session.post(
+                API_URL,
+                json={
+                    "system_message": new_ai_context.system_message,
+                    "faqs": new_ai_context.faqs
+                }
+            ) as response:
+                data = await response.json()
+                return data
+        except Exception as e:
+            HTTPException(status_code=500, detail=f"Ошибка при отправке на API {e}")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=3001)
