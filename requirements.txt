@@ -10,3 +10,4 @@ aiogram
 requests
 minio
 python-multipart
+vk_api

@@ -10,6 +10,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 from crud import async_session, engine, Base, get_chats, get_chat, get_messages, create_chat, create_message, update_chat_waiting, update_chat_ai, get_stats, get_chats_with_last_messages, get_chat_messages, get_chat_by_uuid, add_chat_tag, remove_chat_tag
 import requests
@@ -23,16 +24,320 @@ from sqlalchemy import select, insert
 from crud import Message
 import crud
 from aiogram import F
-from utils import upload_to_minio
 from minio import Minio
 import io
 import tempfile
+import threading
+import vk_api
+from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
+from aiogram.types import FSInputFile
 
 # Load environment variables
 load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
+
+
+VK_TOKEN = os.getenv("VK_TOKEN")        # токен сообщества
+VK_GROUP_ID = int(os.getenv("VK_GROUP_ID"))  # ID вашего сообщества
+
+# Синхронные объекты vk_api
+vk_session = vk_api.VkApi(token=VK_TOKEN)
+vk          = vk_session.get_api()
+longpoll    = VkBotLongPoll(vk_session, VK_GROUP_ID)
+
+# Асинхронная очередь для передачи событий из потока
+queue: asyncio.Queue = asyncio.Queue()
+
+def start_poller(loop: asyncio.AbstractEventLoop):
+    """Запускаем блокирующий longpoll.listen() в фоновом потоке
+       и шлём события в asyncio.Queue."""
+    logging.info("▶️ Запускаю VK-poller thread")
+    def _poller():
+        try:
+            logging.info("🟢 VK bot started polling")
+            for event in longpoll.listen():
+                logging.info(f"🟢 VK event received: {event.type}")
+                # передаём событие в цикл
+                loop.call_soon_threadsafe(queue.put_nowait, event)
+        except Exception as e:
+            logging.error(f"❌ VK poller error: {e}")
+            # Перезапускаем поллер при ошибке
+            loop.call_soon_threadsafe(lambda: start_poller(loop))
+    thread = threading.Thread(target=_poller, daemon=True)
+    thread.start()
+
+async def handle_events():
+    """Асинхронно обрабатываем события из очереди."""
+    logging.info("👂 Начинаю асинхронно обрабатывать VK-события")
+    while True:
+        event = await queue.get()
+        logging.debug("⚪ Взял из очереди событие: %s", event)
+
+        if event.type != VkBotEventType.MESSAGE_NEW:
+            continue
+
+        msg = event.object['message']
+        peer_id = msg['peer_id']
+        user_id = msg['from_id']
+        text = msg.get('text', "")
+        attachments = msg.get("attachments", [])
+
+        # Получаем информацию о пользователе
+        try:
+            user_info = await asyncio.to_thread(
+                vk.users.get,
+                user_ids=[user_id],
+                fields=['first_name', 'last_name']
+            )
+            if user_info:
+                user = user_info[0]
+                user_name = f"{user['first_name']} {user['last_name']}"
+            else:
+                user_name = str(user_id)
+        except Exception as e:
+            logging.error(f"Error getting VK user info: {e}")
+            user_name = str(user_id)
+
+        # --- 1) Работа с чатом в БД, WebSocket-апдейты ---
+        async with async_session() as session:
+            # Получаем или создаём чат
+            chat = await get_chat_by_uuid(session, str(peer_id))
+            if not chat:
+                chat = await create_chat(
+                    session,
+                    str(peer_id),
+                    name=user_name,
+                    messager="vk"
+                )
+                new_chat_message = {
+                    "type": "chat_created",
+                    "chat": {
+                        "id": chat.id,
+                        "uuid": chat.uuid,
+                        "name": chat.name,
+                        "messager": chat.messager,
+                        "waiting": chat.waiting,
+                        "ai": chat.ai,
+                        "tags": chat.tags,
+                        "last_message_content": None,
+                        "last_message_timestamp": None
+                    }
+                }
+                await updates_manager.broadcast(json.dumps(new_chat_message))
+
+            # --- 2) Текстовое сообщение ---
+            if text:
+                # Создаём запись вопроса
+                db_msg = Message(
+                    chat_id=chat.id,
+                    message=text,
+                    message_type="question",
+                    ai=False,
+                    created_at=datetime.now()
+                )
+                session.add(db_msg)
+                await session.commit()
+                await session.refresh(db_msg)
+
+                # Шлём фронту через WS
+                message_for_frontend = {
+                    "type": "message",
+                    "chatId": str(db_msg.chat_id),
+                    "content": db_msg.message,
+                    "message_type": db_msg.message_type,
+                    "ai": db_msg.ai,
+                    "timestamp": db_msg.created_at.isoformat(),
+                    "id": db_msg.id
+                }
+                await messages_manager.broadcast(json.dumps(message_for_frontend))
+
+                # Если AI выключен — обновляем waiting и выходим
+                if not chat.ai:
+                    await update_chat_waiting(db=session, chat_id=chat.id, waiting=True)
+                    await updates_manager.broadcast(json.dumps({
+                        "type": "chat_update",
+                        "chat_id": chat.id,
+                        "waiting": True
+                    }))
+                else:
+                    # --- 3) Отправляем вопрос AI-сервису и ждём ответ ---
+                    async with aiohttp.ClientSession() as http_sess:
+                        try:
+                            resp = await http_sess.post(
+                                API_URL,
+                                json={"question": text, "chat_id": chat.id}
+                            )
+                            data = await resp.json()
+                        except Exception as e:
+                            logging.error(f"AI request error: {e}")
+                            continue
+
+                    # Если пришёл ответ
+                    if data.get("answer"):
+                        answer = data["answer"]
+                        # Отправляем ответ обратно в VK
+                        await asyncio.to_thread(
+                            vk.messages.send,
+                            peer_id=peer_id,
+                            message=answer,
+                            random_id=0
+                        )
+                        # Сохраняем ответ в БД
+                        db_ans = Message(
+                            chat_id=chat.id,
+                            message=answer,
+                            message_type="answer",
+                            ai=True,
+                            created_at=datetime.now()
+                        )
+                        session.add(db_ans)
+                        await session.commit()
+                        await session.refresh(db_ans)
+                        # Шлём фронту
+                        await messages_manager.broadcast(json.dumps({
+                            "type": "message",
+                            "chatId": str(db_ans.chat_id),
+                            "content": db_ans.message,
+                            "message_type": db_ans.message_type,
+                            "ai": db_ans.ai,
+                            "timestamp": db_ans.created_at.isoformat(),
+                            "id": db_ans.id
+                        }))
+
+                    # Если сервис переключил на менеджера
+                    if data.get("manager") == "true":
+                        await update_chat_waiting(db=session, chat_id=chat.id, waiting=True)
+                        await update_chat_ai(db=session, chat_id=chat.id, ai=False)
+                        await updates_manager.broadcast(json.dumps({
+                            "type": "chat_update",
+                            "chat_id": chat.id,
+                            "waiting": True,
+                            "ai": False
+                        }))
+
+            # --- 4) Обработка фото-вложений ---
+            for att in attachments:
+                if att["type"] != "photo":
+                    continue
+                
+                # Получаем прямые URL фотографии
+                photo = att["photo"]
+                logging.info(f"VK photo data: {json.dumps(photo, indent=2)}")
+                
+                # Пробуем получить URL в порядке убывания размера
+                url = None
+                for size in ['photo_1280', 'photo_807', 'photo_604', 'photo_130', 'photo_75']:
+                    if size in photo:
+                        url = photo[size]
+                        logging.info(f"Found photo URL for size {size}: {url}")
+                        break
+                
+                if not url:
+                    # Если не нашли прямые URL, пробуем получить из sizes
+                    if "sizes" in photo:
+                        sizes = photo["sizes"]
+                        max_size = max(sizes, key=lambda s: s["height"])
+                        url = max_size["url"]
+                        logging.info(f"Using URL from sizes: {url}")
+                    else:
+                        logging.error("No suitable photo URL found")
+                        continue
+                
+                logging.info(f"Selected VK photo URL: {url}")
+                
+                # Скачиваем картинку
+                try:
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                        'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+                        'Accept-Language': 'en-US,en;q=0.9',
+                        'Referer': 'https://vk.com/'
+                    }
+                    async with aiohttp.ClientSession() as http_sess:
+                        resp = await http_sess.get(url, headers=headers)
+                        if resp.status != 200:
+                            logging.error(f"Failed to download VK photo: {resp.status}")
+                            continue
+                        content = await resp.read()
+                        if not content:
+                            logging.error("Empty photo content received")
+                            continue
+                        logging.info(f"Successfully downloaded VK photo, size: {len(content)} bytes")
+                except Exception as e:
+                    logging.error(f"VK photo download error: {e}")
+                    continue
+
+                # Загружаем в Minio
+                file_ext = os.path.splitext(url.split('?')[0])[1] or ".jpg"
+                file_name = f"{peer_id}-{int(datetime.now().timestamp())}{file_ext}"
+                logging.info(f"Attempting to upload to MinIO: {file_name}")
+                
+                try:
+                    # Создаем BytesIO объект с правильным размером
+                    file_data = io.BytesIO(content)
+                    file_data.seek(0, 2)  # Перемещаемся в конец файла
+                    file_size = file_data.tell()  # Получаем размер
+                    file_data.seek(0)  # Возвращаемся в начало
+                    
+                    logging.info(f"Uploading to MinIO: {file_name}, size: {file_size} bytes")
+                    
+                    await asyncio.to_thread(
+                        minio_client.put_object,
+                        BUCKET_NAME,
+                        file_name,
+                        file_data,
+                        file_size,
+                        content_type="image/jpeg"
+                    )
+                    img_url = f"http://{APP_HOST}:9000/{BUCKET_NAME}/{file_name}"
+                    logging.info(f"Successfully uploaded to MinIO: {img_url}")
+                except Exception as e:
+                    logging.error(f"MinIO upload error: {e}")
+                    continue
+
+                # Сохраняем как сообщение
+                try:
+                    db_img = Message(
+                        chat_id=chat.id,
+                        message=img_url,
+                        message_type="question",
+                        ai=False,
+                        created_at=datetime.now(),
+                        is_image=True
+                    )
+                    session.add(db_img)
+                    await session.commit()
+                    await session.refresh(db_img)
+                    logging.info(f"Successfully saved message to database with image URL: {img_url}")
+                except Exception as e:
+                    logging.error(f"Database error while saving image message: {e}")
+                    continue
+                # Шлём на фронт
+                await messages_manager.broadcast(json.dumps({
+                    "type": "message",
+                    "chatId": str(db_img.chat_id),
+                    "content": db_img.message,
+                    "message_type": db_img.message_type,
+                    "ai": db_img.ai,
+                    "timestamp": db_img.created_at.isoformat(),
+                    "id": db_img.id,
+                    "is_image": True
+                }))
+                # Обновление waiting
+                await update_chat_waiting(db=session, chat_id=chat.id, waiting=True)
+                await updates_manager.broadcast(json.dumps({
+                    "type": "chat_update",
+                    "chat_id": chat.id,
+                    "waiting": True
+                }))
+
+async def start_vk_bot():
+    loop = asyncio.get_running_loop()
+    start_poller(loop)
+    print("Async VK-бот запущен. Ожидаем сообщений…")
+    await handle_events()
 
 
 # Initialize bot and dispatcher
@@ -42,12 +347,14 @@ dp = Dispatcher()
 # API endpoint for sending questions
 API_URL = os.getenv("API_URL", "http://pavel")
 APP_HOST = os.getenv("APP_HOST", "localhost")
+MINIO_LOGIN = os.getenv("MINIO_LOGIN")
+MINIO_PWD = os.getenv("MINIO_PWD")
 
 BUCKET_NAME = "psih-photo"
 minio_client = Minio(
     endpoint=f"minio:9000",
-    access_key="tim2004timi",
-    secret_key="timitimitimiimi",
+    access_key=MINIO_LOGIN,
+    secret_key=MINIO_PWD,
     secure=False  # True для HTTPS
 )
 
@@ -58,22 +365,34 @@ async def init_db():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Initialize database
+    # Инициализируем БД
     await init_db()
-    # Start the bot polling in the background
-    polling_task = asyncio.create_task(dp.start_polling(bot))
+    
+    # Запускаем aiogram-бота
+    tg_task = asyncio.create_task(dp.start_polling(bot))
+    
+    # Запускаем VK бота
+    vk_task = asyncio.create_task(start_vk_bot())
+    
     yield
-    # Cleanup
-    polling_task.cancel()
+    
+    # Завершаем aiogram-бота
+    tg_task.cancel()
     try:
-        await polling_task
+        await tg_task
+    except asyncio.CancelledError:
+        pass
+
+    # Завершаем VK-бота
+    vk_task.cancel()
+    try:
+        await vk_task
     except asyncio.CancelledError:
         pass
 
 app = FastAPI(lifespan=lifespan)
 
-
-# CORS configuration
+# Увеличиваем лимит размера файла до 10MB
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -208,31 +527,52 @@ class MessageCreate(BaseModel):
 @app.post("/api/messages")
 async def create_message_endpoint(msg: MessageCreate, db: AsyncSession = Depends(get_db)):
     # 1. Создаем сообщение в БД
-    new_message = await create_message(db, msg.chat_id, msg.message, msg.message_type, msg.ai)
-    
-    # 2. Получаем UUID чата для отправки в Телеграм
+    db_msg = await create_message(
+        db=db,
+        chat_id=msg.chat_id,
+        message=msg.message,
+        message_type=msg.message_type,
+        ai=msg.ai
+    )
+
+    # 2. Получаем информацию о чате
     chat = await get_chat(db, msg.chat_id)
-    if chat and chat.uuid:
-        try:
-            await bot.send_message(chat_id=chat.uuid, text=msg.message)
-        except Exception as e:
-            logging.error(f"Error sending message to Telegram chat {chat.uuid}: {e}")
-    
-    # 4. Форматируем сообщение для WebSocket
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+
+    # 3. Отправляем сообщение в соответствующий мессенджер
+    try:
+        if chat.messager == "telegram":
+            # Отправка в Telegram
+            await bot.send_message(
+                chat_id=chat.uuid,
+                text=msg.message
+            )
+        elif chat.messager == "vk":
+            # Отправка в VK
+            await asyncio.to_thread(
+                vk.messages.send,
+                peer_id=int(chat.uuid),
+                message=msg.message,
+                random_id=0
+            )
+    except Exception as e:
+        logging.error(f"Error sending message to {chat.messager}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to send message to {chat.messager}")
+
+    # 4. Отправляем сообщение через WebSocket
     message_for_frontend = {
         "type": "message",
-        "chatId": str(new_message.chat_id),
-        "content": new_message.message,
-        "message_type": new_message.message_type,
-        "ai": new_message.ai,
-        "timestamp": new_message.created_at.isoformat(),
-        "id": new_message.id
+        "chatId": str(db_msg.chat_id),
+        "content": db_msg.message,
+        "message_type": db_msg.message_type,
+        "ai": db_msg.ai,
+        "timestamp": db_msg.created_at.isoformat(),
+        "id": db_msg.id
     }
-
-    # 5. Отправляем на фронтенд по WebSocket
     await messages_manager.broadcast(json.dumps(message_for_frontend))
-    
-    return new_message
+
+    return db_msg
 
 class WaitingUpdate(BaseModel):
     waiting: bool
@@ -294,6 +634,170 @@ async def remove_chat_tag_endpoint(chat_id: int, tag: str, db: AsyncSession = De
         await updates_manager.broadcast(json.dumps(update_message))
     return result
 
+@app.delete("/api/chats/{chat_id}")
+async def delete_chat(chat_id: int, db: AsyncSession = Depends(get_db)):
+    chat = await get_chat(db, chat_id)
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    # Удаляем все сообщения этого чата
+    messages = await db.execute(select(Message).where(Message.chat_id == chat_id))
+    for msg in messages.scalars().all():
+        await db.delete(msg)
+    await db.delete(chat)
+    await db.commit()
+    # Отправляем уведомление по WebSocket всем фронтендам
+    update_message = {
+        "type": "chat_deleted",
+        "chatId": str(chat_id)
+    }
+    await updates_manager.broadcast(json.dumps(update_message))
+    return {"success": True}
+
+@app.post("/api/messages/image")
+async def upload_image(
+    image: UploadFile = File(...),
+    chat_id: int = Form(...),
+    db: AsyncSession = Depends(get_db)
+):
+    # 1. Получаем информацию о чате
+    chat = await get_chat(db, chat_id)
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+
+    # 2. Читаем содержимое файла
+    content = await image.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    # 3. Генерируем имя файла
+    file_ext = os.path.splitext(image.filename)[1] or ".jpg"
+    file_name = f"{chat.uuid}-{int(datetime.now().timestamp())}{file_ext}"
+
+    # 4. Загружаем в MinIO
+    try:
+        await asyncio.to_thread(
+            minio_client.put_object,
+            BUCKET_NAME,
+            file_name,
+            io.BytesIO(content),
+            len(content),
+            content_type="image/jpeg"
+        )
+        img_url = f"http://{APP_HOST}:9000/{BUCKET_NAME}/{file_name}"
+    except Exception as e:
+        logging.error(f"MinIO upload error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to upload image")
+
+    # 5. Сохраняем сообщение в БД
+    db_img = Message(
+        chat_id=chat_id,
+        message=img_url,
+        message_type="answer",
+        ai=False,
+        created_at=datetime.now(),
+        is_image=True
+    )
+    db.add(db_img)
+    await db.commit()
+    await db.refresh(db_img)
+
+    # 6. Отправляем фотографию в соответствующий мессенджер
+    try:
+        if chat.messager == "telegram":
+            # Создаем временный файл для отправки в Telegram
+            with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_file:
+                temp_file.write(content)
+                temp_file.flush()
+                # Отправка в Telegram
+                await bot.send_photo(
+                    chat_id=chat.uuid,
+                    photo=FSInputFile(temp_file.name)
+                )
+            # Удаляем временный файл
+            os.unlink(temp_file.name)
+        elif chat.messager == "vk":
+            # Загружаем фото на сервер VK
+            upload_url = await asyncio.to_thread(
+                vk.photos.getMessagesUploadServer
+            )
+            upload_url = upload_url['upload_url']
+
+            # Отправляем фото на сервер VK
+            async with aiohttp.ClientSession() as http_sess:
+                form = aiohttp.FormData()
+                form.add_field('photo', content, filename='photo.jpg')
+                async with http_sess.post(upload_url, data=form) as resp:
+                    if resp.status != 200:
+                        raise Exception(f"Failed to upload photo to VK: {resp.status}")
+                    upload_result = await resp.json()
+
+            # Сохраняем фото на сервере VK
+            photo_data = await asyncio.to_thread(
+                vk.photos.saveMessagesPhoto,
+                photo=upload_result['photo'],
+                server=upload_result['server'],
+                hash=upload_result['hash']
+            )
+
+            # Отправляем сообщение с фото в VK
+            await asyncio.to_thread(
+                vk.messages.send,
+                peer_id=int(chat.uuid),
+                attachment=f"photo{photo_data[0]['owner_id']}_{photo_data[0]['id']}",
+                random_id=0
+            )
+    except Exception as e:
+        logging.error(f"Error sending photo to {chat.messager}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to send photo to {chat.messager}")
+
+    # 7. Отправляем сообщение через WebSocket
+    message_for_frontend = {
+        "type": "message",
+        "chatId": str(db_img.chat_id),
+        "content": db_img.message,
+        "message_type": db_img.message_type,
+        "ai": db_img.ai,
+        "timestamp": db_img.created_at.isoformat(),
+        "id": db_img.id,
+        "is_image": True
+    }
+    await messages_manager.broadcast(json.dumps(message_for_frontend))
+
+    return db_img
+
+@app.get("/api/ai/context")
+async def get_ai_context():
+    async with aiohttp.ClientSession() as http_session:
+        try:
+            async with http_session.get(
+                API_URL,
+            ) as response:
+                data = await response.json()
+                return data
+        except Exception as e:
+            HTTPException(status_code=500, detail=f"Ошибка при отправке на API {e}")
+
+class PutAIContext(BaseModel):
+    system_message: str
+    faqs: str
+
+@app.put("/api/ai/context")
+async def put_ai_context(new_ai_context: PutAIContext):
+    async with aiohttp.ClientSession() as http_session:
+        try:
+            async with http_session.post(
+                API_URL,
+                json={
+                    "system_message": new_ai_context.system_message,
+                    "faqs": new_ai_context.faqs
+                }
+            ) as response:
+                data = await response.json()
+                return data
+        except Exception as e:
+            HTTPException(status_code=500, detail=f"Ошибка при отправке на API {e}")
+
+
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     await message.answer(
@@ -303,10 +807,6 @@ async def cmd_start(message: Message):
 
 @dp.message(F.text)
 async def handle_message(message: Message):
-    if not message.text:
-        await message.answer("Извините, но я понимаю только текстовые сообщения")
-        return
-
     async with async_session() as session:
         chat = await get_chat_by_uuid(session, str(message.chat.id))
         if not chat:
@@ -484,135 +984,7 @@ async def handle_photos(message: types.Message):
     else:
         await message.reply("Произошла ошибка при загрузке фото")
 
-@app.delete("/api/chats/{chat_id}")
-async def delete_chat(chat_id: int, db: AsyncSession = Depends(get_db)):
-    chat = await get_chat(db, chat_id)
-    if not chat:
-        raise HTTPException(status_code=404, detail="Chat not found")
-    # Удаляем все сообщения этого чата
-    messages = await db.execute(select(Message).where(Message.chat_id == chat_id))
-    for msg in messages.scalars().all():
-        await db.delete(msg)
-    await db.delete(chat)
-    await db.commit()
-    # Отправляем уведомление по WebSocket всем фронтендам
-    update_message = {
-        "type": "chat_deleted",
-        "chatId": str(chat_id)
-    }
-    await updates_manager.broadcast(json.dumps(update_message))
-    return {"success": True}
 
-@app.post("/api/messages/image")
-async def upload_image(
-    image: UploadFile = File(...),
-    chat_id: int = Form(...),
-    db: AsyncSession = Depends(get_db)
-):
-    try:
-        # Get chat from database
-        chat = await get_chat(db, chat_id)
-        if not chat:
-            raise HTTPException(status_code=404, detail="Chat not found")
-
-        # Read image file
-        contents = await image.read()
-        
-        # Generate unique filename
-        file_extension = os.path.splitext(image.filename)[1]
-        file_name = f"{chat_id}-{datetime.now().strftime('%Y%m%d%H%M%S')}{file_extension}"
-        
-        # Upload to MinIO
-        try:
-            minio_client.put_object(
-                bucket_name=BUCKET_NAME,
-                object_name=file_name,
-                data=io.BytesIO(contents),
-                length=len(contents),
-                content_type=image.content_type
-            )
-        except Exception as e:
-            logging.error(f"Error uploading to MinIO: {e}")
-            raise HTTPException(status_code=500, detail="Failed to upload image to storage")
-        
-        # Create message in database
-        image_url = f"http://{APP_HOST}:9000/{BUCKET_NAME}/{file_name}"
-        new_message = Message(
-            chat_id=chat_id,
-            message=image_url,
-            message_type="answer",
-            ai=False,
-            created_at=datetime.now(),
-            is_image=True
-        )
-        db.add(new_message)
-        await db.commit()
-        await db.refresh(new_message)
-        
-        # Send to Telegram
-        try:
-            # Create a temporary file to send to Telegram
-            with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_file:
-                temp_file.write(contents)
-                temp_file.flush()
-                await bot.send_photo(chat_id=chat.uuid, photo=types.FSInputFile(temp_file.name))
-            # Clean up the temporary file
-            os.unlink(temp_file.name)
-        except Exception as e:
-            logging.error(f"Error sending photo to Telegram: {e}")
-        
-        # Send WebSocket update
-        message_for_frontend = {
-            "type": "message",
-            "chatId": str(new_message.chat_id),
-            "content": new_message.message,
-            "message_type": new_message.message_type,
-            "ai": new_message.ai,
-            "timestamp": new_message.created_at.isoformat(),
-            "id": new_message.id,
-            "is_image": new_message.is_image
-        }
-        await messages_manager.broadcast(json.dumps(message_for_frontend))
-        
-        return {"success": True, "message": "Image uploaded successfully"}
-        
-    except Exception as e:
-        logging.error(f"Error uploading image: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-
-@app.get("/api/ai/context")
-async def get_ai_context():
-    async with aiohttp.ClientSession() as http_session:
-        try:
-            async with http_session.get(
-                API_URL,
-            ) as response:
-                data = await response.json()
-                return data
-        except Exception as e:
-            HTTPException(status_code=500, detail=f"Ошибка при отправке на API {e}")
-
-class PutAIContext(BaseModel):
-    system_message: str
-    faqs: str
-
-@app.put("/api/ai/context")
-async def put_ai_context(new_ai_context: PutAIContext):
-    async with aiohttp.ClientSession() as http_session:
-        try:
-            async with http_session.post(
-                API_URL,
-                json={
-                    "system_message": new_ai_context.system_message,
-                    "faqs": new_ai_context.faqs
-                }
-            ) as response:
-                data = await response.json()
-                return data
-        except Exception as e:
-            HTTPException(status_code=500, detail=f"Ошибка при отправке на API {e}")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=3001)
