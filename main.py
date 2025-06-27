@@ -579,9 +579,20 @@ class WaitingUpdate(BaseModel):
 
 @app.put("/api/chats/{chat_id}/waiting")
 async def update_waiting(chat_id: int, data: WaitingUpdate, db: AsyncSession = Depends(get_db)):
+    chat = await get_chat(db, chat_id)
+    old_waiting = chat.waiting
     chat = await update_chat_waiting(db, chat_id, data.waiting)
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
+    
+    if chat.waiting != old_waiting:
+        stats = await get_stats(db)
+        await updates_manager.broadcast(json.dumps({
+                    "type": "stats_update",
+                    "total": stats["total"], 
+                    "pending": stats["pending"], 
+                    "ai": stats["ai"]
+                }))
     return {"success": True, "chat": chat}
 
 class AIUpdate(BaseModel):
@@ -880,7 +891,6 @@ async def handle_message(message: Message):
                         await message.answer("Извините, произошла ошибка при обработке запроса")
                     if "answer" in data:
                         answer = data["answer"]
-                        print(answer)
                         await message.answer(answer)
                         # Create message in database
                         new_answer = Message(
@@ -906,7 +916,6 @@ async def handle_message(message: Message):
                         # Отправляем на фронтенд по WebSocket
                         await messages_manager.broadcast(json.dumps(message_for_frontend))
                     if "manager" in data and data["manager"] == "true":
-                        print(data["manager"])
                         await update_chat_waiting(db=session, chat_id=chat.id, waiting=True)
                         await update_chat_ai(db=session, chat_id=chat.id, ai=False)
                         # Send WebSocket update about chat status change
