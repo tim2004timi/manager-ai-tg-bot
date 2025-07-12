@@ -31,6 +31,7 @@ import threading
 import vk_api
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 from aiogram.types import FSInputFile
+import auth
 
 # Load environment variables
 load_dotenv()
@@ -490,13 +491,13 @@ async def updates_websocket(websocket: WebSocket):
 
 # Endpoints
 @app.get("/api/chats")
-async def read_chats(db: AsyncSession = Depends(get_db)):
+async def read_chats(db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
     chats_data = await get_chats_with_last_messages(db)
     print("Backend /api/chats response data:", chats_data)
     return chats_data
 
 @app.get("/api/chats/{chat_id}")
-async def read_chat(chat_id: int, db: AsyncSession = Depends(get_db)):
+async def read_chat(chat_id: int, db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
     chat = await get_chat(db, chat_id)
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
@@ -505,7 +506,8 @@ async def read_chat(chat_id: int, db: AsyncSession = Depends(get_db)):
 @app.get("/api/chats/{chat_id}/messages")
 async def read_messages(
     chat_id: int,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _: bool = Depends(auth.require_auth)
 ):
     return await get_chat_messages(db, chat_id)
 
@@ -515,7 +517,7 @@ class ChatCreate(BaseModel):
     ai: bool = False
 
 @app.post("/api/chats")
-async def create_chat_endpoint(chat: ChatCreate, db: AsyncSession = Depends(get_db)):
+async def create_chat_endpoint(chat: ChatCreate, db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
     return await create_chat(db, chat.uuid, chat.ai)
 
 class MessageCreate(BaseModel):
@@ -525,7 +527,7 @@ class MessageCreate(BaseModel):
     ai: bool = False
 
 @app.post("/api/messages")
-async def create_message_endpoint(msg: MessageCreate, db: AsyncSession = Depends(get_db)):
+async def create_message_endpoint(msg: MessageCreate, db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
     # 1. Создаем сообщение в БД
     db_msg = await create_message(
         db=db,
@@ -578,7 +580,7 @@ class WaitingUpdate(BaseModel):
     waiting: bool
 
 @app.put("/api/chats/{chat_id}/waiting")
-async def update_waiting(chat_id: int, data: WaitingUpdate, db: AsyncSession = Depends(get_db)):
+async def update_waiting(chat_id: int, data: WaitingUpdate, db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
     chat = await get_chat(db, chat_id)
     old_waiting = chat.waiting
     chat = await update_chat_waiting(db, chat_id, data.waiting)
@@ -599,7 +601,7 @@ class AIUpdate(BaseModel):
     ai: bool
 
 @app.put("/api/chats/{chat_id}/ai")
-async def update_ai(chat_id: int, data: AIUpdate, db: AsyncSession = Depends(get_db)):
+async def update_ai(chat_id: int, data: AIUpdate, db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
     chat = await update_chat_ai(db, chat_id, data.ai)
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
@@ -613,14 +615,14 @@ async def update_ai(chat_id: int, data: AIUpdate, db: AsyncSession = Depends(get
     return chat
 
 @app.get("/api/stats")
-async def stats(db: AsyncSession = Depends(get_db)):
+async def stats(db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
     return await get_stats(db)
 
 class TagCreate(BaseModel):
     tag: str
 
 @app.post("/api/chats/{chat_id}/tags")
-async def add_chat_tag_endpoint(chat_id: int, tag_data: TagCreate, db: AsyncSession = Depends(get_db)):
+async def add_chat_tag_endpoint(chat_id: int, tag_data: TagCreate, db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
     result = await crud.add_chat_tag(db, chat_id, tag_data.tag)
     if result.get("success"):
         # Broadcast updated tags via WebSocket
@@ -633,7 +635,7 @@ async def add_chat_tag_endpoint(chat_id: int, tag_data: TagCreate, db: AsyncSess
     return result
 
 @app.delete("/api/chats/{chat_id}/tags/{tag}")
-async def remove_chat_tag_endpoint(chat_id: int, tag: str, db: AsyncSession = Depends(get_db)):
+async def remove_chat_tag_endpoint(chat_id: int, tag: str, db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
     result = await crud.remove_chat_tag(db, chat_id, tag)
     if result.get("success"):
         # Broadcast updated tags via WebSocket
@@ -646,7 +648,7 @@ async def remove_chat_tag_endpoint(chat_id: int, tag: str, db: AsyncSession = De
     return result
 
 @app.delete("/api/chats/{chat_id}")
-async def delete_chat(chat_id: int, db: AsyncSession = Depends(get_db)):
+async def delete_chat(chat_id: int, db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
     chat = await get_chat(db, chat_id)
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
@@ -668,7 +670,8 @@ async def delete_chat(chat_id: int, db: AsyncSession = Depends(get_db)):
 async def upload_image(
     image: UploadFile = File(...),
     chat_id: int = Form(...),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _: bool = Depends(auth.require_auth)
 ):
     # 1. Получаем информацию о чате
     chat = await get_chat(db, chat_id)
@@ -777,7 +780,7 @@ async def upload_image(
     return db_img
 
 @app.get("/api/ai/context")
-async def get_ai_context():
+async def get_ai_context(_: bool = Depends(auth.require_auth)):
     async with aiohttp.ClientSession() as http_session:
         try:
             async with http_session.get(
@@ -793,7 +796,7 @@ class PutAIContext(BaseModel):
     faqs: str
 
 @app.put("/api/ai/context")
-async def put_ai_context(new_ai_context: PutAIContext):
+async def put_ai_context(new_ai_context: PutAIContext, _: bool = Depends(auth.require_auth)):
     async with aiohttp.ClientSession() as http_session:
         try:
             async with http_session.post(
@@ -807,6 +810,21 @@ async def put_ai_context(new_ai_context: PutAIContext):
                 return data
         except Exception as e:
             HTTPException(status_code=500, detail=f"Ошибка при отправке на API {e}")
+
+@app.post("/api/auth/refresh-token")
+async def refresh_token_endpoint(request: Request):
+    """
+    Эндпоинт для обновления JWT токена
+    """
+    token = await auth.get_token_from_header(request)
+    if not token:
+        raise HTTPException(status_code=401, detail="Authorization header missing or invalid")
+    
+    result = await auth.refresh_token(token)
+    if result is None:
+        raise HTTPException(status_code=401, detail="Failed to refresh token")
+    
+    return result
 
 
 @dp.message(Command("start"))
