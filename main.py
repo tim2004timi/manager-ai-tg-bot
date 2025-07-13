@@ -396,7 +396,7 @@ app = FastAPI(lifespan=lifespan)
 # Увеличиваем лимит размера файла до 10MB
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://82.202.143.118:8080", "http://localhost:8080"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
