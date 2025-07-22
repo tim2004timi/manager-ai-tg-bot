@@ -119,7 +119,7 @@ async def get_stats(db: AsyncSession):
     ai_count = await db.scalar(select(func.count(Chat.id)).filter(Chat.ai == True))
     return {"total": total, "pending": pending, "ai": ai_count}
 
-async def get_chats_with_last_messages(db: AsyncSession, limit: int = 20) -> List[Dict[str, Any]]:
+async def get_chats_with_last_messages(db: AsyncSession, limit: int = 10000) -> List[Dict[str, Any]]:
     """Get all chats with their last message"""
     # First get all chats
     query = select(Chat).order_by(desc(Chat.id))
