@@ -1,2 +1,4 @@
 .env
 __pycache__
+admin_chat_ids.json
+admin_notifications.json

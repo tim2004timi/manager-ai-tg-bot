@@ -32,6 +32,7 @@ import vk_api
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 from aiogram.types import FSInputFile
 import auth
+import notifications
 
 # Load environment variables
 load_dotenv()
@@ -162,6 +163,15 @@ async def handle_events():
                         "chat_id": chat.id,
                         "waiting": True
                     }))
+                    
+                    # Отправляем уведомление админам
+                    notification_manager = notifications.get_notification_manager()
+                    if notification_manager:
+                        await notification_manager.send_waiting_notification(
+                            chat_id=peer_id,
+                            chat_name=user_name,
+                            messager="vk"
+                        )
                 else:
                     # --- 3) Отправляем вопрос AI-сервису и ждём ответ ---
                     async with aiohttp.ClientSession() as http_sess:
@@ -217,6 +227,15 @@ async def handle_events():
                             "waiting": True,
                             "ai": False
                         }))
+                        
+                        # Отправляем уведомление админам
+                        notification_manager = notifications.get_notification_manager()
+                        if notification_manager:
+                            await notification_manager.send_waiting_notification(
+                                chat_id=peer_id,
+                                chat_name=user_name,
+                                messager="vk"
+                            )
 
             # --- 4) Обработка фото-вложений ---
             for att in attachments:
@@ -333,6 +352,15 @@ async def handle_events():
                     "chat_id": chat.id,
                     "waiting": True
                 }))
+                
+                # Отправляем уведомление админам
+                notification_manager = notifications.get_notification_manager()
+                if notification_manager:
+                    await notification_manager.send_waiting_notification(
+                        chat_id=peer_id,
+                        chat_name=user_name,
+                        messager="vk"
+                    )
 
 async def start_vk_bot():
     loop = asyncio.get_running_loop()
@@ -368,6 +396,9 @@ async def init_db():
 async def lifespan(app: FastAPI):
     # Инициализируем БД
     await init_db()
+    
+    # Инициализируем менеджер уведомлений
+    notifications.init_notification_manager(bot)
     
     # Запускаем aiogram-бота
     tg_task = asyncio.create_task(dp.start_polling(bot))
@@ -829,9 +860,71 @@ async def refresh_token_endpoint(request: Request):
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
+    # Проверяем, является ли пользователь админом
+    notification_manager = notifications.get_notification_manager()
+    if notification_manager:
+        user_username = message.from_user.username
+        if user_username and user_username in notification_manager.admin_usernames:
+            # Сохраняем chat_id админа
+            await notification_manager.save_admin_chat_id(user_username, message.chat.id)
+            
+            # Отправляем приветствие с клавиатурой управления уведомлениями
+            await message.answer(
+                "👋 Добро пожаловать в панель администратора!\n\n"
+                "Здесь вы можете управлять уведомлениями о новых сообщениях.",
+                reply_markup=notification_manager.get_notification_keyboard(user_username)
+            )
+            return
+    
+    # Обычное приветствие для обычных пользователей
     await message.answer(
         "Добро пожаловать в Psihclothes!\n"
         "Можете задать любой вопрос"
+    )
+
+@dp.callback_query(lambda c: c.data.startswith("notifications_"))
+async def handle_notification_toggle(callback: types.CallbackQuery):
+    """Обработчик переключения уведомлений"""
+    notification_manager = notifications.get_notification_manager()
+    if not notification_manager:
+        await callback.answer("Ошибка: менеджер уведомлений не инициализирован")
+        return
+    
+    # Извлекаем username из callback_data
+    parts = callback.data.split("_")
+    if len(parts) >= 3:
+        action = parts[1]  # on или off
+        username = "_".join(parts[2:])  # username может содержать подчеркивания
+        
+        if username in notification_manager.admin_usernames:
+            await notification_manager.toggle_notifications(username, callback.message.chat.id)
+            await callback.answer()
+        else:
+            await callback.answer("Ошибка: пользователь не найден в списке админов")
+    else:
+        await callback.answer("Ошибка: неверный формат callback данных")
+
+@dp.message(Command("notifications"))
+async def cmd_notifications(message: Message):
+    """Команда для вызова панели управления уведомлениями"""
+    notification_manager = notifications.get_notification_manager()
+    if not notification_manager:
+        await message.answer("Ошибка: менеджер уведомлений не инициализирован")
+        return
+    
+    user_username = message.from_user.username
+    if not user_username or user_username not in notification_manager.admin_usernames:
+        await message.answer("⛔ У вас нет доступа к панели администратора.")
+        return
+    
+    # Сохраняем chat_id админа
+    await notification_manager.save_admin_chat_id(user_username, message.chat.id)
+    
+    # Отправляем панель управления уведомлениями
+    await message.answer(
+        "🔔 Панель управления уведомлениями\n\n"
+        "Здесь вы можете управлять уведомлениями о новых сообщениях.",
+        reply_markup=notification_manager.get_notification_keyboard(user_username)
     )
 
 @dp.message(F.text)
@@ -891,6 +984,15 @@ async def handle_message(message: Message):
                 "waiting": True
             }
             await updates_manager.broadcast(json.dumps(update_message))
+            
+            # Отправляем уведомление админам
+            notification_manager = notifications.get_notification_manager()
+            if notification_manager:
+                await notification_manager.send_waiting_notification(
+                    chat_id=message.chat.id,
+                    chat_name=message.chat.first_name or str(message.chat.id),
+                    messager="telegram"
+                )
             return
         
         async with aiohttp.ClientSession() as http_session:
@@ -944,6 +1046,15 @@ async def handle_message(message: Message):
                             "ai": False
                         }
                         await updates_manager.broadcast(json.dumps(update_message))
+                        
+                        # Отправляем уведомление админам
+                        notification_manager = notifications.get_notification_manager()
+                        if notification_manager:
+                            await notification_manager.send_waiting_notification(
+                                chat_id=message.chat.id,
+                                chat_name=message.chat.first_name or str(message.chat.id),
+                                messager="telegram"
+                            )
 
 
             except Exception as e:
@@ -1008,6 +1119,15 @@ async def handle_photos(message: types.Message):
                 "waiting": True
             }
             await updates_manager.broadcast(json.dumps(update_message))
+            
+            # Отправляем уведомление админам
+            notification_manager = notifications.get_notification_manager()
+            if notification_manager:
+                await notification_manager.send_waiting_notification(
+                    chat_id=message.chat.id,
+                    chat_name=message.chat.first_name or str(message.chat.id),
+                    messager="telegram"
+                )
     else:
         await message.reply("Произошла ошибка при загрузке фото")
 
