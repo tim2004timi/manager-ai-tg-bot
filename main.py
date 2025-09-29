@@ -404,7 +404,7 @@ async def lifespan(app: FastAPI):
     tg_task = asyncio.create_task(dp.start_polling(bot))
     
     # Запускаем VK бота
-    "vk_task = asyncio.create_task(start_vk_bot())
+    # vk_task = asyncio.create_task(start_vk_bot())
     
     yield
     
@@ -416,11 +416,11 @@ async def lifespan(app: FastAPI):
         pass
 
     # Завершаем VK-бота
-    vk_task.cancel()
-    try:
-        await vk_task
-    except asyncio.CancelledError:
-        pass
+    # vk_task.cancel()
+    # try:
+    #     await vk_task
+    # except asyncio.CancelledError:
+    #     pass
 
 app = FastAPI(lifespan=lifespan)
 
