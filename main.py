@@ -404,7 +404,7 @@ async def lifespan(app: FastAPI):
     tg_task = asyncio.create_task(dp.start_polling(bot))
     
     # Запускаем VK бота
-    vk_task = asyncio.create_task(start_vk_bot())
+    "vk_task = asyncio.create_task(start_vk_bot())
     
     yield
     
